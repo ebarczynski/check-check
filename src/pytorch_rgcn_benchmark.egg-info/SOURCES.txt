@@ -4,7 +4,10 @@ src/pytorch_rgcn_benchmark.egg-info/PKG-INFO
 src/pytorch_rgcn_benchmark.egg-info/SOURCES.txt
 src/pytorch_rgcn_benchmark.egg-info/dependency_links.txt
 src/pytorch_rgcn_benchmark.egg-info/entry_points.txt
+src/pytorch_rgcn_benchmark.egg-info/requires.txt
 src/pytorch_rgcn_benchmark.egg-info/top_level.txt
 src/rgcn_benchmark/__init__.py
+src/rgcn_benchmark/benchmark_utils.py
 src/rgcn_benchmark/compare.py
+src/rgcn_benchmark/mlx_train.py
 src/rgcn_benchmark/train.py

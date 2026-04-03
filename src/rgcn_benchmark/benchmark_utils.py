@@ -36,6 +36,51 @@ def iso_utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def project_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def resolve_config_path(path: Path) -> Path:
+    base_candidates = [path]
+    if path.suffix != ".json":
+        base_candidates.append(path.with_suffix(".json"))
+
+    candidates: list[Path] = []
+    root = project_root()
+    for candidate in base_candidates:
+        candidates.append(candidate)
+        if not candidate.is_absolute():
+            candidates.append(root / candidate)
+            if len(candidate.parts) == 1:
+                candidates.append(root / "configs" / candidate.name)
+
+    seen: set[Path] = set()
+    unique_candidates: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve(strict=False)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_candidates.append(candidate)
+
+    for candidate in unique_candidates:
+        if candidate.is_file():
+            return candidate
+
+    preset_dir = root / "configs"
+    available_presets = []
+    if preset_dir.is_dir():
+        available_presets = sorted(entry.name for entry in preset_dir.glob("*.json"))
+
+    attempted = ", ".join(str(candidate) for candidate in unique_candidates)
+    available = ", ".join(available_presets) if available_presets else "none found"
+    raise FileNotFoundError(
+        "Could not find benchmark config. "
+        f"Tried: {attempted}. "
+        f"Available presets in configs/: {available}."
+    )
+
+
 def slugify(value: str) -> str:
     collapsed = re.sub(r"[^a-zA-Z0-9]+", "-", value.strip().lower())
     return collapsed.strip("-") or "run"

@@ -193,7 +193,8 @@ def load_benchmark_config(path: Path | None) -> BenchmarkConfig:
     if path is None:
         return config
 
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    resolved_path = benchmark_utils.resolve_config_path(path)
+    payload = json.loads(resolved_path.read_text(encoding="utf-8"))
     config.name = payload.get("name", config.name)
     config.description = payload.get("description", config.description)
 
