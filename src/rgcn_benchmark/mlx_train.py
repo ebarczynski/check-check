@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import csv
+import gc
 import importlib.metadata
 import json
 import math
@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from rgcn_benchmark import benchmark_utils
 
 try:
     import mlx.core as mx
@@ -76,6 +77,9 @@ class BenchmarkConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     run: RunConfig = field(default_factory=RunConfig)
+    sizing: benchmark_utils.SizingConfig = field(
+        default_factory=benchmark_utils.SizingConfig
+    )
 
 
 @dataclass
@@ -124,6 +128,31 @@ def parse_args() -> argparse.Namespace:
         "--warmup-epochs",
         type=int,
         help="Exclude the first N epochs from steady-state summary metrics.",
+    )
+    parser.add_argument(
+        "--auto-size",
+        action="store_true",
+        help="Probe unified-memory headroom and scale the graph toward a target budget before the full run.",
+    )
+    parser.add_argument(
+        "--target-memory-gb",
+        type=float,
+        help="Absolute unified-memory budget to target during autosizing.",
+    )
+    parser.add_argument(
+        "--target-memory-fraction",
+        type=float,
+        help="Fraction of available unified memory to target during autosizing.",
+    )
+    parser.add_argument(
+        "--sizing-tolerance",
+        type=float,
+        help="Relative autosizing tolerance, for example 0.08 for +/-8%%.",
+    )
+    parser.add_argument(
+        "--sizing-max-probes",
+        type=int,
+        help="Maximum number of autosizing calibration probes.",
     )
     parser.add_argument("--num-nodes", type=int, help="Override number of nodes.")
     parser.add_argument("--num-relations", type=int, help="Override number of edge relations.")
@@ -176,6 +205,8 @@ def load_benchmark_config(path: Path | None) -> BenchmarkConfig:
         config.optimizer = replace(config.optimizer, **payload["optimizer"])
     if "run" in payload:
         config.run = replace(config.run, **payload["run"])
+    if "sizing" in payload:
+        config.sizing = replace(config.sizing, **payload["sizing"])
 
     return config
 
@@ -195,6 +226,20 @@ def apply_cli_overrides(config: BenchmarkConfig, args: argparse.Namespace) -> Be
         config.run.min_duration_sec = args.min_duration_sec
     if args.warmup_epochs is not None:
         config.run.warmup_epochs = args.warmup_epochs
+    if args.auto_size:
+        config.sizing.enabled = True
+    if args.target_memory_gb is not None:
+        config.sizing.enabled = True
+        config.sizing.target_memory_gb = args.target_memory_gb
+    if args.target_memory_fraction is not None:
+        config.sizing.enabled = True
+        config.sizing.target_memory_fraction = args.target_memory_fraction
+    if args.sizing_tolerance is not None:
+        config.sizing.enabled = True
+        config.sizing.tolerance = args.sizing_tolerance
+    if args.sizing_max_probes is not None:
+        config.sizing.enabled = True
+        config.sizing.max_probes = args.sizing_max_probes
     if args.num_nodes is not None:
         config.graph.num_nodes = args.num_nodes
     if args.num_relations is not None:
@@ -232,6 +277,7 @@ def validate_config(config: BenchmarkConfig) -> None:
     graph = config.graph
     model = config.model
     run = config.run
+    sizing = config.sizing
 
     if graph.num_nodes <= 0:
         raise ValueError("num_nodes must be positive")
@@ -265,6 +311,14 @@ def validate_config(config: BenchmarkConfig) -> None:
         raise ValueError("log_every must be positive")
     if run.precision not in {"fp32", "fp16", "bf16"}:
         raise ValueError("precision must be one of fp32, fp16, bf16")
+    if sizing.target_memory_gb is not None and sizing.target_memory_gb <= 0.0:
+        raise ValueError("target_memory_gb must be positive")
+    if sizing.target_memory_fraction is not None and not 0.0 < sizing.target_memory_fraction <= 1.0:
+        raise ValueError("target_memory_fraction must be in the interval (0, 1]")
+    if not 0.0 < sizing.tolerance < 1.0:
+        raise ValueError("sizing tolerance must be in the interval (0, 1)")
+    if sizing.max_probes <= 0:
+        raise ValueError("sizing max_probes must be positive")
 
 
 def resolve_device(requested_device: str) -> tuple[Any, str]:
@@ -295,6 +349,7 @@ def mlx_version() -> str | None:
 
 
 def collect_hardware_info(device_name: str) -> dict[str, Any]:
+    host_memory_gb = physical_memory_gb()
     return {
         "platform": platform.platform(),
         "machine": platform.machine(),
@@ -303,7 +358,8 @@ def collect_hardware_info(device_name: str) -> dict[str, Any]:
         "backend": device_name,
         "device_type": device_name,
         "device_name": f"{platform.processor() or 'Apple Silicon'} {device_name.upper()}",
-        "host_memory_gb": physical_memory_gb(),
+        "host_memory_gb": host_memory_gb,
+        "total_device_memory_gb": host_memory_gb,
     }
 
 
@@ -339,6 +395,28 @@ def read_memory_stats() -> dict[str, float | None]:
     }
 
 
+def available_memory_gb(hardware: dict[str, Any]) -> float | None:
+    total_device_memory_gb = hardware.get("total_device_memory_gb")
+    if total_device_memory_gb is not None:
+        return float(total_device_memory_gb)
+    return hardware.get("host_memory_gb")
+
+
+def is_oom_error(error: BaseException) -> bool:
+    if isinstance(error, MemoryError):
+        return True
+    if "outofmemory" in type(error).__name__.lower():
+        return True
+    message = str(error).lower()
+    return "out of memory" in message or "not enough memory" in message
+
+
+def cleanup_device_memory() -> None:
+    gc.collect()
+    if mx is not None and hasattr(mx, "clear_cache"):
+        mx.clear_cache()
+
+
 def peak_memory_value(memory_stats: dict[str, float | None]) -> float | None:
     for key in ("peak_allocated_gb", "allocated_gb", "reserved_gb"):
         value = memory_stats.get(key)
@@ -356,6 +434,19 @@ def precision_to_dtype(precision: str) -> Any:
     if hasattr(mx, "bfloat16"):
         return mx.bfloat16
     raise ValueError("MLX bfloat16 is not available in this environment")
+
+
+def build_epoch_estimates(config: BenchmarkConfig) -> dict[str, float]:
+    storage_bytes = benchmark_utils.precision_bytes(config.run.precision)
+    return benchmark_utils.estimate_epoch_telemetry(
+        config.graph,
+        config.model,
+        config.run.precision,
+        feature_storage_bytes=storage_bytes,
+        parameter_storage_bytes=storage_bytes,
+        index_dtype_bytes=4,
+        label_dtype_bytes=4,
+    )
 
 
 def build_synthetic_graph(config: GraphConfig, dtype: Any) -> SyntheticGraph:
@@ -450,6 +541,137 @@ def aggregate_by_destination(aggregated: Any, destination: Any, messages: Any) -
 
     aggregated[unique_destination] = aggregated[unique_destination] + segment_sums
     return aggregated
+
+
+def probe_graph_memory(
+    config: BenchmarkConfig,
+    candidate_graph_config: GraphConfig,
+    scale: float,
+    probe_index: int,
+) -> benchmark_utils.AutosizeProbe:
+    graph = None
+    model = None
+    optimizer = None
+    loss_and_grad_fn = None
+    loss_value = None
+    accuracy_value = None
+    grads = None
+
+    try:
+        dtype = precision_to_dtype(config.run.precision)
+        graph = build_synthetic_graph(candidate_graph_config, dtype)
+        model = RGCNModel(candidate_graph_config, config.model, dtype)
+        optimizer = build_optimizer(config.optimizer)
+        loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+        mx.eval(model.parameters())
+
+        model.train()
+        reset_peak_memory_stats()
+        synchronize_device()
+        probe_started = time.perf_counter()
+        (loss_value, accuracy_value), grads = loss_and_grad_fn(model, graph)
+        optimizer.update(model, grads)
+        mx.eval(loss_value, accuracy_value, model.parameters(), optimizer.state)
+        synchronize_device()
+        epoch_seconds = time.perf_counter() - probe_started
+        memory_stats = read_memory_stats()
+
+        return benchmark_utils.AutosizeProbe(
+            probe=probe_index,
+            scale=scale,
+            num_nodes=candidate_graph_config.num_nodes,
+            edges_per_relation=candidate_graph_config.edges_per_relation,
+            measured_memory_gb=benchmark_utils.effective_memory_usage_gb(memory_stats),
+            epoch_seconds=epoch_seconds,
+            oom=False,
+        )
+    except Exception as error:
+        if not is_oom_error(error):
+            raise
+        return benchmark_utils.AutosizeProbe(
+            probe=probe_index,
+            scale=scale,
+            num_nodes=candidate_graph_config.num_nodes,
+            edges_per_relation=candidate_graph_config.edges_per_relation,
+            measured_memory_gb=None,
+            epoch_seconds=None,
+            oom=True,
+            note=str(error).splitlines()[0][:200],
+        )
+    finally:
+        del graph, model, optimizer, loss_and_grad_fn, loss_value, accuracy_value, grads
+        cleanup_device_memory()
+
+
+def maybe_auto_size_config(
+    config: BenchmarkConfig,
+    hardware: dict[str, Any],
+) -> tuple[BenchmarkConfig, dict[str, Any]]:
+    if not config.sizing.enabled:
+        return config, {
+            "enabled": False,
+            "available_memory_gb": available_memory_gb(hardware),
+            "target_memory_gb": config.sizing.target_memory_gb,
+            "probe_history": [],
+        }
+
+    print(
+        "Autosizing graph toward the requested unified-memory budget...",
+        flush=True,
+    )
+
+    def probe_fn(
+        candidate_graph_config: GraphConfig,
+        scale: float,
+        probe_index: int,
+    ) -> benchmark_utils.AutosizeProbe:
+        probe = probe_graph_memory(
+            config,
+            candidate_graph_config,
+            scale,
+            probe_index,
+        )
+        memory_fragment = (
+            f"{probe.measured_memory_gb:.2f}GB"
+            if probe.measured_memory_gb is not None
+            else "n/a"
+        )
+        epoch_fragment = (
+            f"{probe.epoch_seconds:.2f}s" if probe.epoch_seconds is not None else "n/a"
+        )
+        note_fragment = f" note={probe.note}" if probe.note else ""
+        status = "oom" if probe.oom else "ok"
+        print(
+            f"autosize probe {probe.probe}/{config.sizing.max_probes}: "
+            f"scale={probe.scale:.3f} "
+            f"nodes={probe.num_nodes:,} "
+            f"edges/rel={probe.edges_per_relation:,} "
+            f"mem={memory_fragment} "
+            f"epoch_s={epoch_fragment} "
+            f"status={status}{note_fragment}",
+            flush=True,
+        )
+        return probe
+
+    graph_config, autosize_summary = benchmark_utils.auto_size_graph(
+        config.graph,
+        config.sizing,
+        available_memory_gb(hardware),
+        probe_fn,
+    )
+    measured_memory = autosize_summary.get("final_measured_memory_gb")
+    measured_fragment = (
+        f"{measured_memory:.2f}GB" if measured_memory is not None else "n/a"
+    )
+    print(
+        f"Autosize selected scale={autosize_summary['final_scale']:.3f} "
+        f"nodes={graph_config.num_nodes:,} "
+        f"edges/rel={graph_config.edges_per_relation:,} "
+        f"target={autosize_summary['target_memory_gb']:.2f}GB "
+        f"measured={measured_fragment}",
+        flush=True,
+    )
+    return replace(config, graph=graph_config), autosize_summary
 
 
 class RGCNBlock(nn.Module):
@@ -633,23 +855,29 @@ def format_epoch_line(record: dict[str, Any]) -> str:
 
 def run_benchmark(config: BenchmarkConfig, device: Any, device_name: str) -> Path:
     ensure_mlx_available()
-    started_at = iso_utc_now()
+    started_at = benchmark_utils.iso_utc_now()
     setup_start = time.perf_counter()
 
     seed_everything(config.graph.seed)
     configure_runtime(device)
+    hardware = collect_hardware_info(device_name)
+    config, autosize_summary = maybe_auto_size_config(config, hardware)
     dtype = precision_to_dtype(config.run.precision)
     graph = build_synthetic_graph(config.graph, dtype)
     model = RGCNModel(config.graph, config.model, dtype)
     optimizer = build_optimizer(config.optimizer)
     loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    epoch_estimates = build_epoch_estimates(config)
 
     mx.eval(model.parameters())
     synchronize_device()
     setup_seconds = time.perf_counter() - setup_start
-    run_dir = create_run_dir(config, f"mlx-{device_name}")
+    run_dir = benchmark_utils.create_run_dir(
+        config.run.results_dir,
+        config.name,
+        f"mlx-{device_name}",
+    )
 
-    hardware = collect_hardware_info(device_name)
     command = " ".join(shlex.quote(arg) for arg in sys.argv)
     message_edges_per_epoch = graph.total_edges * config.model.num_layers
 
@@ -705,18 +933,22 @@ def run_benchmark(config: BenchmarkConfig, device: Any, device_name: str) -> Pat
             "peak_allocated_gb": memory_stats["peak_allocated_gb"],
             "peak_reserved_gb": memory_stats["peak_reserved_gb"],
             "driver_allocated_gb": memory_stats["driver_allocated_gb"],
+            "effective_memory_gb": benchmark_utils.effective_memory_usage_gb(
+                memory_stats
+            ),
             "peak_memory_gb": peak_memory_value(memory_stats),
             "setup_seconds": setup_seconds,
         }
+        benchmark_utils.attach_epoch_telemetry(record, epoch_estimates)
         history.append(record)
 
         if epoch == 1 or epoch % config.run.log_every == 0:
-            print(format_epoch_line(record), flush=True)
+            print(benchmark_utils.format_epoch_line(record), flush=True)
 
         if epoch >= config.run.epochs and elapsed_seconds >= config.run.min_duration_sec:
             break
 
-    finished_at = iso_utc_now()
+    finished_at = benchmark_utils.iso_utc_now()
     summary = {
         "run": {
             "name": config.name,
@@ -743,13 +975,19 @@ def run_benchmark(config: BenchmarkConfig, device: Any, device_name: str) -> Pat
             "edge_chunk_size": config.model.edge_chunk_size,
             "ffn_multiplier": config.model.ffn_multiplier,
             "message_edges_per_epoch": message_edges_per_epoch,
+            "graph_scale": autosize_summary.get("final_scale", 1.0),
         },
-        "metrics": summarize_history(history, config, graph),
+        "metrics": benchmark_utils.summarize_history(
+            history,
+            config.run.warmup_epochs,
+            int(graph.train_index.shape[0]),
+        ),
+        "autosize": autosize_summary,
         "config": asdict(config),
     }
 
-    write_history_csv(run_dir / "history.csv", history)
-    write_summary_json(run_dir / "summary.json", summary)
+    benchmark_utils.write_history_csv(run_dir / "history.csv", history)
+    benchmark_utils.write_summary_json(run_dir / "summary.json", summary)
     print(f"Summary written to {run_dir / 'summary.json'}", flush=True)
     return run_dir
 

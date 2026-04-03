@@ -9,6 +9,8 @@ This project benchmarks the same Relational Graph Convolutional Network workload
 
 The benchmark is intentionally designed to keep accelerators busy for long runs. The default presets use large synthetic relational graphs, multiple RGCN layers, and an MLP inside each block. Every preset also enforces a minimum training duration so runs do not end before one hour unless you explicitly override that behavior.
 
+The runners now also support an autosizing phase that probes memory headroom, scales the graph toward a target VRAM or unified-memory budget, and logs estimated bandwidth and TOPS for every epoch.
+
 ## Track Layout
 
 - Use the PyTorch track when you want the fairest framework-controlled backend comparison across CUDA, ROCm, and Apple MPS.
@@ -23,8 +25,9 @@ The MLX runner shares the same config schema and result structure as the PyTorch
 - Keeps the PyTorch model backend-portable by implementing RGCN message passing directly in PyTorch with dense relation weights and `index_add_` aggregation.
 - Adds an MLX-native Apple runner that uses MLX arrays, MLX modules, and deterministic segmented relation aggregation.
 - Adds a feed-forward expansion inside each RGCN block so the run is not purely scatter-bound.
+- Can auto-scale `num_nodes` and `edges_per_relation` toward a requested memory budget before the full benchmark starts.
 - Stops only after both conditions are satisfied: target epoch count reached and minimum wall-clock duration reached.
-- Writes a per-epoch CSV log plus a machine-readable JSON summary for cross-platform comparison.
+- Writes a per-epoch CSV log plus a machine-readable JSON summary for cross-platform comparison, including estimated bandwidth and TOPS.
 
 ## Install
 
@@ -148,12 +151,44 @@ python -m rgcn_benchmark.train \
   --min-duration-sec 5400
 ```
 
+Auto-size a CUDA or ROCm run to a concrete VRAM budget:
+
+```bash
+python -m rgcn_benchmark.train \
+  --config configs/cuda_rocm_6gb_long.json \
+  --device cuda \
+  --auto-size \
+  --target-memory-gb 5.4
+```
+
+Auto-size a PyTorch MPS run to a fraction of unified memory:
+
+```bash
+python -m rgcn_benchmark.train \
+  --config configs/apple_mps_64gb_long.json \
+  --device mps \
+  --auto-size \
+  --target-memory-fraction 0.75
+```
+
+Auto-size an MLX-native Apple run to a unified-memory budget:
+
+```bash
+python -m rgcn_benchmark.mlx_train \
+  --config configs/apple_mlx_64gb_long.json \
+  --device gpu \
+  --auto-size \
+  --target-memory-gb 48
+```
+
 ## Results
 
 Each run creates a timestamped directory under `results/` with:
 
 - `summary.json`: backend, device, workload, config, and aggregate metrics
-- `history.csv`: per-epoch loss, accuracy, duration, throughput, and memory statistics
+- `history.csv`: per-epoch loss, accuracy, duration, throughput, memory statistics, estimated bandwidth, and estimated TOPS
+
+When autosizing is enabled, `summary.json` also contains the target budget, the selected graph scale, and the full probe history used to find it.
 
 Compare multiple completed runs:
 
@@ -171,6 +206,7 @@ The compare table includes a framework column, so PyTorch and MLX runs can be mi
 
 - If GPU utilization is low, increase `hidden_dim`, `num_layers`, or `edges_per_relation`.
 - If memory usage is the limiter, lower `hidden_dim` before lowering `num_relations`.
+- If hardware capacity varies across machines, use `--auto-size` and target about 80% to 90% of available memory rather than maintaining separate hand-tuned configs per device.
 - If the run is too short, raise `min_duration_sec` or scale the graph up.
 - On Apple MPS, smaller `edge_chunk_size` values are often more stable than aggressive chunk sizes.
 - On Apple MLX, lower `edge_chunk_size` first if the native runner becomes memory-bound.

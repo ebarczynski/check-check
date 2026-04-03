@@ -9,6 +9,8 @@ from typing import Any
 
 SORT_KEY_MAP = {
     "steady_state_message_edge_updates_per_sec_median": "edge_updates_per_sec",
+    "steady_state_estimated_bandwidth_gbps_median": "estimated_bandwidth_gbps",
+    "steady_state_estimated_tops_median": "estimated_tops",
     "steady_state_epoch_sec_median": "epoch_sec",
     "peak_memory_gb": "peak_memory_gb",
 }
@@ -23,6 +25,8 @@ def parse_args() -> argparse.Namespace:
         "--sort-by",
         choices=(
             "steady_state_message_edge_updates_per_sec_median",
+            "steady_state_estimated_bandwidth_gbps_median",
+            "steady_state_estimated_tops_median",
             "steady_state_epoch_sec_median",
             "peak_memory_gb",
         ),
@@ -58,6 +62,10 @@ def load_summary(path: Path) -> dict[str, Any]:
         "edge_updates_per_sec": metrics[
             "steady_state_message_edge_updates_per_sec_median"
         ],
+        "estimated_bandwidth_gbps": metrics.get(
+            "steady_state_estimated_bandwidth_gbps_median"
+        ),
+        "estimated_tops": metrics.get("steady_state_estimated_tops_median"),
         "peak_memory_gb": metrics["peak_memory_gb"],
         "training_duration_sec": metrics["training_duration_sec"],
     }
@@ -84,6 +92,8 @@ def rows_to_markdown(rows: list[dict[str, Any]]) -> str:
         "Layers",
         "Median epoch s",
         "Median M edge updates/s",
+        "Median GB/s",
+        "Median TOPS",
         "Peak GB",
         "Duration s",
     ]
@@ -108,6 +118,8 @@ def rows_to_markdown(rows: list[dict[str, Any]]) -> str:
                     format_number(row["num_layers"], 0),
                     format_number(row["epoch_sec"]),
                     format_number(row["edge_updates_per_sec"] / 1e6),
+                    format_number(row["estimated_bandwidth_gbps"]),
+                    format_number(row["estimated_tops"], 4),
                     format_number(row["peak_memory_gb"]),
                     format_number(row["training_duration_sec"]),
                 ]
