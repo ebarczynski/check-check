@@ -1,0 +1,34 @@
+{
+  "name": "cuda_rocm_24gb_long",
+  "description": "Long-running preset for 24 GB class NVIDIA CUDA and AMD ROCm accelerators.",
+  "graph": {
+    "num_nodes": 120000,
+    "num_relations": 12,
+    "edges_per_relation": 1200000,
+    "input_dim": 256,
+    "num_classes": 64,
+    "train_fraction": 0.8,
+    "seed": 17
+  },
+  "model": {
+    "hidden_dim": 768,
+    "num_layers": 4,
+    "dropout": 0.1,
+    "edge_chunk_size": 32768,
+    "ffn_multiplier": 2
+  },
+  "optimizer": {
+    "name": "adamw",
+    "lr": 0.0007,
+    "weight_decay": 0.01
+  },
+  "run": {
+    "epochs": 400,
+    "min_duration_sec": 3600,
+    "warmup_epochs": 5,
+    "log_every": 1,
+    "precision": "fp32",
+    "results_dir": "results",
+    "tf32": true
+  }
+}

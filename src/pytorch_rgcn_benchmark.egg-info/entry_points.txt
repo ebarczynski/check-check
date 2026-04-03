@@ -1,0 +1,3 @@
+[console_scripts]
+rgcn-benchmark = rgcn_benchmark.train:main
+rgcn-compare = rgcn_benchmark.compare:main
