@@ -1,31 +1,36 @@
-# PyTorch RGCN Hardware Benchmark
+# PyTorch And MLX RGCN Hardware Benchmark
 
-This project benchmarks the same PyTorch Relational Graph Convolutional Network workload across:
+This project benchmarks the same Relational Graph Convolutional Network workload across two tracks:
 
-- NVIDIA GPUs through the PyTorch CUDA backend
-- AMD GPUs through the PyTorch ROCm backend
-- Apple Silicon through the PyTorch MPS backend (Metal)
+- PyTorch on NVIDIA GPUs through CUDA
+- PyTorch on AMD GPUs through ROCm
+- PyTorch on Apple Silicon through MPS (Metal)
+- MLX-native execution on Apple Silicon through the MLX GPU or CPU device
 
 The benchmark is intentionally designed to keep accelerators busy for long runs. The default presets use large synthetic relational graphs, multiple RGCN layers, and an MLP inside each block. Every preset also enforces a minimum training duration so runs do not end before one hour unless you explicitly override that behavior.
 
-## Why MPS Instead Of MLX
+## Track Layout
 
-MLX is a separate framework. If you want a fair backend comparison while staying inside the PyTorch framework, the Apple target should be PyTorch MPS, which uses Metal underneath.
+- Use the PyTorch track when you want the fairest framework-controlled backend comparison across CUDA, ROCm, and Apple MPS.
+- Use the MLX track when you want to measure Apple Silicon with a native MLX implementation as a separate framework track.
+- The comparison tool can mix PyTorch and MLX summaries in one table. It now includes a framework column so PyTorch MPS and MLX GPU runs stay distinguishable.
 
-If you also want an MLX-native RGCN implementation, that should be treated as a second benchmark track rather than mixed into this one, because it changes both the framework and operator stack.
+The MLX runner shares the same config schema and result structure as the PyTorch runner so the workload settings stay comparable.
 
 ## Benchmark Design
 
 - Uses a synthetic full-batch relational graph, so every platform runs the same deterministic workload without dataset download friction.
-- Keeps the model backend-portable by implementing RGCN message passing directly in PyTorch with dense relation weights and `index_add_` aggregation.
+- Keeps the PyTorch model backend-portable by implementing RGCN message passing directly in PyTorch with dense relation weights and `index_add_` aggregation.
+- Adds an MLX-native Apple runner that uses MLX arrays, MLX modules, and deterministic segmented relation aggregation.
 - Adds a feed-forward expansion inside each RGCN block so the run is not purely scatter-bound.
 - Stops only after both conditions are satisfied: target epoch count reached and minimum wall-clock duration reached.
 - Writes a per-epoch CSV log plus a machine-readable JSON summary for cross-platform comparison.
 
 ## Install
 
-1. Install a PyTorch build that matches the hardware backend on the target machine.
-2. Install this package in editable mode.
+1. Install a PyTorch build that matches the hardware backend on the target machine if you want the PyTorch track.
+2. Install MLX on Apple Silicon if you want the MLX-native track.
+3. Install this package in editable mode.
 
 Examples:
 
@@ -34,10 +39,18 @@ python -m pip install -U pip
 python -m pip install -e .
 ```
 
+Apple Silicon with MLX:
+
+```bash
+python -m pip install -U pip
+python -m pip install -e .[apple]
+```
+
 Notes:
 
 - For NVIDIA CUDA and AMD ROCm, install PyTorch from the current official PyTorch selector for the exact driver and runtime version on that machine.
 - Apple Silicon wheels from the standard PyPI flow expose the `mps` backend when macOS and PyTorch support it.
+- MLX is optional and only needed for the native Apple runner.
 
 ## Quick Smoke Test
 
@@ -47,7 +60,19 @@ Use the small config first to confirm the backend works end-to-end before starti
 python -m rgcn_benchmark.train --config configs/smoke_test.json --device auto
 ```
 
+Apple Silicon MLX smoke test:
+
+```bash
+python -m rgcn_benchmark.mlx_train --config configs/smoke_test.json --device auto
+```
+
 ## Long-Run Presets
+
+6 GB class NVIDIA or AMD dGPUs:
+
+```bash
+python -m rgcn_benchmark.train --config configs/cuda_rocm_6gb_long.json --device cuda
+```
 
 24 GB class NVIDIA or AMD GPUs:
 
@@ -67,9 +92,17 @@ Apple Silicon with larger unified memory:
 python -m rgcn_benchmark.train --config configs/apple_mps_64gb_long.json --device mps
 ```
 
+Apple Silicon MLX-native long run:
+
+```bash
+python -m rgcn_benchmark.mlx_train --config configs/apple_mlx_64gb_long.json --device gpu
+```
+
 Important:
 
 - PyTorch on ROCm still uses `cuda` as the device type, so the ROCm command also uses `--device cuda`.
+- The 6 GB preset is sized to fit mid-range discrete GPUs while still enforcing a 1h minimum runtime.
+- The MLX runner uses `--device gpu` or `--device cpu`; `auto` prefers GPU when available.
 - The benchmark keeps training until both `epochs` and `min_duration_sec` are satisfied.
 - If you want a fixed 1h floor everywhere, keep `min_duration_sec` at `3600`.
 
@@ -106,6 +139,15 @@ python -m rgcn_benchmark.train \
   --precision fp16
 ```
 
+Use a smaller dGPU-safe preset and still force a longer run:
+
+```bash
+python -m rgcn_benchmark.train \
+  --config configs/cuda_rocm_6gb_long.json \
+  --device cuda \
+  --min-duration-sec 5400
+```
+
 ## Results
 
 Each run creates a timestamped directory under `results/` with:
@@ -119,8 +161,11 @@ Compare multiple completed runs:
 python -m rgcn_benchmark.compare \
   results/20260403T100000Z_cuda24_cuda/summary.json \
   results/20260403T120000Z_rocm24_rocm/summary.json \
-  results/20260403T140000Z_mps64_mps/summary.json
+  results/20260403T140000Z_mps64_mps/summary.json \
+  results/20260403T160000Z_mlx64_gpu/summary.json
 ```
+
+The compare table includes a framework column, so PyTorch and MLX runs can be mixed safely.
 
 ## Tuning Guidance
 
@@ -128,3 +173,5 @@ python -m rgcn_benchmark.compare \
 - If memory usage is the limiter, lower `hidden_dim` before lowering `num_relations`.
 - If the run is too short, raise `min_duration_sec` or scale the graph up.
 - On Apple MPS, smaller `edge_chunk_size` values are often more stable than aggressive chunk sizes.
+- On Apple MLX, lower `edge_chunk_size` first if the native runner becomes memory-bound.
+- On 6 GB dGPUs, start from `configs/cuda_rocm_6gb_long.json` and scale `hidden_dim` upward in small steps.

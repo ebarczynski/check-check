@@ -46,6 +46,7 @@ def load_summary(path: Path) -> dict[str, Any]:
     return {
         "summary_path": str(path),
         "run": run["name"],
+        "framework": run.get("framework", "pytorch"),
         "backend": run["backend"],
         "device_name": hardware.get("device_name", "unknown"),
         "precision": run["precision"],
@@ -73,6 +74,7 @@ def format_number(value: float | int | None, digits: int = 2) -> str:
 def rows_to_markdown(rows: list[dict[str, Any]]) -> str:
     headers = [
         "Run",
+        "Framework",
         "Backend",
         "Device",
         "Precision",
@@ -96,6 +98,7 @@ def rows_to_markdown(rows: list[dict[str, Any]]) -> str:
             + " | ".join(
                 [
                     row["run"],
+                    row["framework"],
                     row["backend"],
                     row["device_name"],
                     row["precision"],

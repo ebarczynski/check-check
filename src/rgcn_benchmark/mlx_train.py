@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.metadata
 import json
+import math
 import os
 import platform
 import random
@@ -11,15 +13,21 @@ import shlex
 import statistics
 import sys
 import time
-from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import torch
-import torch.nn.functional as F
-from torch import Tensor, nn
+import numpy as np
+
+try:
+    import mlx.core as mx
+    import mlx.nn as nn
+    import mlx.optimizers as optim
+except ModuleNotFoundError:
+    mx = None
+    nn = None
+    optim = None
 
 
 @dataclass
@@ -57,13 +65,13 @@ class RunConfig:
     log_every: int = 1
     precision: str = "fp32"
     results_dir: str = "results"
-    tf32: bool = True
+    tf32: bool = False
 
 
 @dataclass
 class BenchmarkConfig:
-    name: str = "rgcn_portable_long"
-    description: str = "Portable PyTorch RGCN benchmark"
+    name: str = "apple_mlx_long"
+    description: str = "MLX-native Apple RGCN benchmark"
     graph: GraphConfig = field(default_factory=GraphConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
@@ -72,32 +80,35 @@ class BenchmarkConfig:
 
 @dataclass
 class SyntheticGraph:
-    features: Tensor
-    labels: Tensor
-    train_index: Tensor
-    train_labels: Tensor
-    relations: list[tuple[Tensor, Tensor, Tensor]]
+    features: Any
+    labels: Any
+    train_index: Any
+    train_labels: Any
+    relations: list[tuple[Any, Any, Any]]
     total_edges: int
+
+
+def ensure_mlx_available() -> None:
+    if mx is None or nn is None or optim is None:
+        raise RuntimeError(
+            "MLX is not installed. On Apple Silicon, install it with `python -m pip install -e .[apple]`."
+        )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark a backend-portable PyTorch RGCN workload."
+        description="Benchmark an MLX-native RGCN workload on Apple Silicon."
     )
     parser.add_argument("--config", type=Path, help="Path to a JSON config preset.")
     parser.add_argument(
         "--device",
         default="auto",
-        choices=("auto", "cuda", "mps", "cpu"),
-        help="Target device. ROCm uses 'cuda' in PyTorch.",
+        choices=("auto", "gpu", "cpu"),
+        help="Target MLX device.",
     )
     parser.add_argument("--name", help="Override the run name.")
     parser.add_argument("--description", help="Override the run description.")
-    parser.add_argument(
-        "--results-dir",
-        type=Path,
-        help="Override the results directory.",
-    )
+    parser.add_argument("--results-dir", type=Path, help="Override the results directory.")
     parser.add_argument(
         "--precision",
         choices=("fp32", "fp16", "bf16"),
@@ -115,14 +126,8 @@ def parse_args() -> argparse.Namespace:
         help="Exclude the first N epochs from steady-state summary metrics.",
     )
     parser.add_argument("--num-nodes", type=int, help="Override number of nodes.")
-    parser.add_argument(
-        "--num-relations", type=int, help="Override number of edge relations."
-    )
-    parser.add_argument(
-        "--edges-per-relation",
-        type=int,
-        help="Override edges per relation.",
-    )
+    parser.add_argument("--num-relations", type=int, help="Override number of edge relations.")
+    parser.add_argument("--edges-per-relation", type=int, help="Override edges per relation.")
     parser.add_argument("--input-dim", type=int, help="Override input feature width.")
     parser.add_argument("--num-classes", type=int, help="Override class count.")
     parser.add_argument(
@@ -133,11 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, help="Override random seed.")
     parser.add_argument("--hidden-dim", type=int, help="Override hidden dimension.")
     parser.add_argument("--num-layers", type=int, help="Override number of RGCN blocks.")
-    parser.add_argument(
-        "--dropout",
-        type=float,
-        help="Override dropout probability.",
-    )
+    parser.add_argument("--dropout", type=float, help="Override dropout probability.")
     parser.add_argument(
         "--edge-chunk-size",
         type=int,
@@ -149,18 +150,11 @@ def parse_args() -> argparse.Namespace:
         help="Override the hidden expansion factor inside each RGCN block.",
     )
     parser.add_argument("--lr", type=float, help="Override learning rate.")
-    parser.add_argument(
-        "--weight-decay", type=float, help="Override optimizer weight decay."
-    )
+    parser.add_argument("--weight-decay", type=float, help="Override optimizer weight decay.")
     parser.add_argument(
         "--optimizer",
         choices=("adamw", "sgd"),
         help="Override optimizer type.",
-    )
-    parser.add_argument(
-        "--disable-tf32",
-        action="store_true",
-        help="Disable TF32 acceleration on CUDA backends.",
     )
     return parser.parse_args()
 
@@ -231,12 +225,10 @@ def apply_cli_overrides(config: BenchmarkConfig, args: argparse.Namespace) -> Be
         config.optimizer.weight_decay = args.weight_decay
     if args.optimizer is not None:
         config.optimizer.name = args.optimizer
-    if args.disable_tf32:
-        config.run.tf32 = False
     return config
 
 
-def validate_config(config: BenchmarkConfig, device: torch.device) -> None:
+def validate_config(config: BenchmarkConfig) -> None:
     graph = config.graph
     model = config.model
     run = config.run
@@ -273,32 +265,17 @@ def validate_config(config: BenchmarkConfig, device: torch.device) -> None:
         raise ValueError("log_every must be positive")
     if run.precision not in {"fp32", "fp16", "bf16"}:
         raise ValueError("precision must be one of fp32, fp16, bf16")
-    if device.type == "cpu" and run.precision != "fp32":
-        raise ValueError("CPU runs currently support only fp32 in this benchmark")
-    if device.type == "mps" and run.precision == "bf16":
-        raise ValueError("MPS runs should use fp32 or fp16, not bf16")
 
 
-def resolve_device(requested_device: str) -> torch.device:
+def resolve_device(requested_device: str) -> tuple[Any, str]:
+    ensure_mlx_available()
+    gpu_count = int(mx.device_count(mx.gpu))
+
     if requested_device == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-
-    if requested_device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA or ROCm device requested but not available")
-    if requested_device == "mps":
-        if not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available():
-            raise RuntimeError("MPS device requested but not available")
-    return torch.device(requested_device)
-
-
-def backend_label(device: torch.device) -> str:
-    if device.type == "cuda":
-        return "rocm" if torch.version.hip is not None else "cuda"
-    return device.type
+        return (mx.gpu, "gpu") if gpu_count > 0 else (mx.cpu, "cpu")
+    if requested_device == "gpu" and gpu_count <= 0:
+        raise RuntimeError("MLX GPU requested but no GPU device is available")
+    return (mx.gpu, "gpu") if requested_device == "gpu" else (mx.cpu, "cpu")
 
 
 def physical_memory_gb() -> float | None:
@@ -310,180 +287,169 @@ def physical_memory_gb() -> float | None:
     return (page_size * page_count) / (1024**3)
 
 
-def collect_hardware_info(device: torch.device) -> dict[str, Any]:
-    info: dict[str, Any] = {
+def mlx_version() -> str | None:
+    try:
+        return importlib.metadata.version("mlx")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def collect_hardware_info(device_name: str) -> dict[str, Any]:
+    return {
         "platform": platform.platform(),
         "machine": platform.machine(),
         "python_version": platform.python_version(),
-        "torch_version": torch.__version__,
-        "backend": backend_label(device),
-        "device_type": device.type,
+        "mlx_version": mlx_version(),
+        "backend": device_name,
+        "device_type": device_name,
+        "device_name": f"{platform.processor() or 'Apple Silicon'} {device_name.upper()}",
         "host_memory_gb": physical_memory_gb(),
     }
-
-    if device.type == "cuda":
-        device_index = device.index if device.index is not None else torch.cuda.current_device()
-        props = torch.cuda.get_device_properties(device_index)
-        info.update(
-            {
-                "device_name": torch.cuda.get_device_name(device_index),
-                "total_device_memory_gb": props.total_memory / (1024**3),
-                "multiprocessor_count": props.multi_processor_count,
-                "cuda_runtime": torch.version.cuda,
-                "hip_runtime": torch.version.hip,
-            }
-        )
-    elif device.type == "mps":
-        info.update(
-            {
-                "device_name": platform.processor() or "Apple Silicon",
-                "mps_available": torch.backends.mps.is_available(),
-                "mps_built": torch.backends.mps.is_built(),
-            }
-        )
-    else:
-        info["device_name"] = platform.processor() or "CPU"
-
-    return info
 
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
 
 
-def configure_runtime(config: BenchmarkConfig, device: torch.device) -> None:
-    torch.set_float32_matmul_precision("high")
-
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = config.run.tf32
-        torch.backends.cudnn.allow_tf32 = config.run.tf32
+def configure_runtime(device: Any) -> None:
+    ensure_mlx_available()
+    mx.set_default_device(device)
+    mx.set_default_stream(mx.default_stream(device))
 
 
-def synchronize_device(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elif device.type == "mps":
-        torch.mps.synchronize()
+def synchronize_device() -> None:
+    ensure_mlx_available()
+    mx.synchronize()
 
 
-def reset_peak_memory_stats(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
+def reset_peak_memory_stats() -> None:
+    ensure_mlx_available()
+    mx.reset_peak_memory()
 
 
-def read_memory_stats(device: torch.device) -> dict[str, float | None]:
-    stats: dict[str, float | None] = {
-        "allocated_gb": None,
-        "reserved_gb": None,
-        "peak_allocated_gb": None,
+def read_memory_stats() -> dict[str, float | None]:
+    ensure_mlx_available()
+    return {
+        "allocated_gb": mx.get_active_memory() / (1024**3),
+        "reserved_gb": mx.get_cache_memory() / (1024**3),
+        "peak_allocated_gb": mx.get_peak_memory() / (1024**3),
         "peak_reserved_gb": None,
         "driver_allocated_gb": None,
     }
 
-    if device.type == "cuda":
-        stats["allocated_gb"] = torch.cuda.memory_allocated(device) / (1024**3)
-        stats["reserved_gb"] = torch.cuda.memory_reserved(device) / (1024**3)
-        stats["peak_allocated_gb"] = torch.cuda.max_memory_allocated(device) / (1024**3)
-        stats["peak_reserved_gb"] = torch.cuda.max_memory_reserved(device) / (1024**3)
-    elif device.type == "mps":
-        if hasattr(torch.mps, "current_allocated_memory"):
-            stats["allocated_gb"] = torch.mps.current_allocated_memory() / (1024**3)
-        if hasattr(torch.mps, "driver_allocated_memory"):
-            stats["driver_allocated_gb"] = torch.mps.driver_allocated_memory() / (1024**3)
-
-    return stats
-
 
 def peak_memory_value(memory_stats: dict[str, float | None]) -> float | None:
-    for key in ("peak_allocated_gb", "allocated_gb", "driver_allocated_gb"):
+    for key in ("peak_allocated_gb", "allocated_gb", "reserved_gb"):
         value = memory_stats.get(key)
         if value is not None:
             return value
     return None
 
 
-def autocast_context(device: torch.device, precision: str):
+def precision_to_dtype(precision: str) -> Any:
+    ensure_mlx_available()
     if precision == "fp32":
-        return nullcontext()
-    dtype = torch.float16 if precision == "fp16" else torch.bfloat16
-    return torch.autocast(device_type=device.type, dtype=dtype)
+        return mx.float32
+    if precision == "fp16":
+        return mx.float16
+    if hasattr(mx, "bfloat16"):
+        return mx.bfloat16
+    raise ValueError("MLX bfloat16 is not available in this environment")
 
 
-def make_grad_scaler(device: torch.device, precision: str):
-    if device.type != "cuda" or precision != "fp16":
-        return None
-    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        return torch.amp.GradScaler("cuda")
-    return torch.cuda.amp.GradScaler()
+def build_synthetic_graph(config: GraphConfig, dtype: Any) -> SyntheticGraph:
+    ensure_mlx_available()
+    print("Preparing synthetic graph for MLX...", flush=True)
+    rng = np.random.default_rng(config.seed)
 
-
-def build_synthetic_graph(config: GraphConfig, device: torch.device) -> SyntheticGraph:
-    print("Preparing synthetic graph...", flush=True)
-    generator = torch.Generator(device="cpu").manual_seed(config.seed)
-
-    features = torch.randn(
-        (config.num_nodes, config.input_dim),
-        generator=generator,
-        dtype=torch.float32,
-    )
-    teacher = torch.randn(
-        (config.input_dim, config.num_classes),
-        generator=generator,
-        dtype=torch.float32,
-    )
-    labels = (features @ teacher).argmax(dim=1).to(torch.long)
-
+    features = rng.standard_normal((config.num_nodes, config.input_dim)).astype(np.float32)
+    teacher = rng.standard_normal((config.input_dim, config.num_classes)).astype(np.float32)
+    labels = (features @ teacher).argmax(axis=1).astype(np.int32)
     train_count = max(1, int(config.num_nodes * config.train_fraction))
-    train_index = torch.randperm(config.num_nodes, generator=generator)[:train_count]
-    edge_weight = torch.ones(config.edges_per_relation, dtype=torch.float32)
+    train_index = rng.permutation(config.num_nodes)[:train_count].astype(np.int32)
 
-    features = features.to(device)
-    labels = labels.to(device)
-    train_index = train_index.to(device)
-    train_labels = labels.index_select(0, train_index)
+    features_array = mx.array(features)
+    if dtype != mx.float32:
+        features_array = features_array.astype(dtype)
 
-    relations: list[tuple[Tensor, Tensor, Tensor]] = []
+    labels_array = mx.array(labels)
+    train_index_array = mx.array(train_index)
+    train_labels = labels_array[train_index_array]
+
+    relations: list[tuple[Any, Any, Any]] = []
     for relation_id in range(config.num_relations):
         print(
             f"  relation {relation_id + 1}/{config.num_relations}: "
             f"{config.edges_per_relation:,} edges",
             flush=True,
         )
-        source = torch.randint(
-            config.num_nodes,
-            (config.edges_per_relation,),
-            generator=generator,
-            dtype=torch.int64,
-        )
-        destination = torch.randint(
-            config.num_nodes,
-            (config.edges_per_relation,),
-            generator=generator,
-            dtype=torch.int64,
-        )
-        degree = torch.zeros(config.num_nodes, dtype=torch.float32)
-        degree.index_add_(0, destination, edge_weight)
-        normalization = degree.index_select(0, destination).clamp_min_(1.0).reciprocal()
-        relations.append(
-            (
-                source.to(device),
-                destination.to(device),
-                normalization.to(device),
-            )
-        )
+        source = rng.integers(0, config.num_nodes, size=config.edges_per_relation, dtype=np.int32)
+        destination = rng.integers(0, config.num_nodes, size=config.edges_per_relation, dtype=np.int32)
+        degree = np.bincount(destination, minlength=config.num_nodes).astype(np.float32)
+        normalization = (1.0 / np.maximum(degree[destination], 1.0)).astype(np.float32)
+
+        source_array = mx.array(source)
+        destination_array = mx.array(destination)
+        normalization_array = mx.array(normalization)
+        if dtype != mx.float32:
+            normalization_array = normalization_array.astype(dtype)
+        relations.append((source_array, destination_array, normalization_array))
 
     return SyntheticGraph(
-        features=features,
-        labels=labels,
-        train_index=train_index,
+        features=features_array,
+        labels=labels_array,
+        train_index=train_index_array,
         train_labels=train_labels,
         relations=relations,
         total_edges=config.num_relations * config.edges_per_relation,
     )
+
+
+def glorot_uniform(shape: tuple[int, ...], dtype: Any) -> Any:
+    ensure_mlx_available()
+    if len(shape) < 2:
+        raise ValueError("glorot_uniform expects at least two dimensions")
+    fan_in = shape[-2]
+    fan_out = shape[-1]
+    limit = math.sqrt(6.0 / (fan_in + fan_out))
+    values = (mx.random.uniform(shape=shape) * (2.0 * limit)) - limit
+    return values.astype(dtype) if dtype != mx.float32 else values
+
+
+def aggregate_by_destination(aggregated: Any, destination: Any, messages: Any) -> Any:
+    edge_count = int(destination.shape[0])
+    if edge_count == 0:
+        return aggregated
+
+    order = mx.argsort(destination)
+    sorted_destination = destination[order]
+    sorted_messages = messages[order]
+
+    if edge_count == 1:
+        unique_destination = sorted_destination
+        segment_sums = sorted_messages
+    else:
+        changes = sorted_destination[1:] != sorted_destination[:-1]
+        first_true = mx.array(np.array([True]))
+        boundaries = mx.concatenate([first_true, changes], axis=0)
+        unique_destination = sorted_destination[boundaries]
+
+        positions = mx.arange(edge_count - 1, dtype=destination.dtype)
+        last_position = mx.array(np.array([edge_count - 1], dtype=np.int32))
+        end_positions = mx.concatenate([positions[changes], last_position], axis=0)
+        first_position = mx.array(np.array([0], dtype=np.int32))
+        start_positions = mx.concatenate([first_position, end_positions[:-1] + 1], axis=0)
+
+        prefix = mx.cumsum(sorted_messages, axis=0)
+        prefix_prev = mx.concatenate(
+            [mx.zeros((1, messages.shape[1]), dtype=messages.dtype), prefix[:-1]],
+            axis=0,
+        )
+        segment_sums = prefix[end_positions] - prefix_prev[start_positions]
+
+    aggregated[unique_destination] = aggregated[unique_destination] + segment_sums
+    return aggregated
 
 
 class RGCNBlock(nn.Module):
@@ -494,105 +460,92 @@ class RGCNBlock(nn.Module):
         dropout: float,
         edge_chunk_size: int,
         ffn_multiplier: int,
+        dtype: Any,
     ) -> None:
         super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_relations = num_relations
         self.edge_chunk_size = edge_chunk_size
-
-        self.self_loop = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.relation_weights = nn.Parameter(
-            torch.empty(num_relations, hidden_dim, hidden_dim)
-        )
-        self.output_norm = nn.LayerNorm(hidden_dim)
-        self.ffn_norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
+        self.self_loop = nn.Linear(input_dims=hidden_dim, output_dims=hidden_dim, bias=False)
+        self.relation_weights = glorot_uniform((num_relations, hidden_dim, hidden_dim), dtype)
+        self.output_norm = nn.LayerNorm(dims=hidden_dim)
+        self.ffn_norm = nn.LayerNorm(dims=hidden_dim)
+        self.dropout = nn.Dropout(p=dropout)
         inner_dim = hidden_dim * ffn_multiplier
-        self.ffn_in = nn.Linear(hidden_dim, inner_dim, bias=False)
-        self.ffn_out = nn.Linear(inner_dim, hidden_dim, bias=False)
+        self.ffn_in = nn.Linear(input_dims=hidden_dim, output_dims=inner_dim, bias=False)
+        self.ffn_out = nn.Linear(input_dims=inner_dim, output_dims=hidden_dim, bias=False)
 
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.self_loop.weight)
-        nn.init.xavier_uniform_(self.relation_weights)
-        nn.init.xavier_uniform_(self.ffn_in.weight)
-        nn.init.xavier_uniform_(self.ffn_out.weight)
-
-    def forward(self, x: Tensor, relations: list[tuple[Tensor, Tensor, Tensor]]) -> Tensor:
-        aggregated = x.new_zeros(x.shape)
+    def __call__(self, x: Any, relations: list[tuple[Any, Any, Any]]) -> Any:
+        aggregated = mx.zeros_like(x)
 
         for relation_index, (source, destination, normalization) in enumerate(relations):
             weight = self.relation_weights[relation_index]
-            edge_count = int(source.numel())
+            edge_count = int(source.shape[0])
 
             for start in range(0, edge_count, self.edge_chunk_size):
                 stop = min(start + self.edge_chunk_size, edge_count)
-                source_states = x.index_select(0, source[start:stop])
-                messages = source_states.matmul(weight)
-                normalization_slice = normalization[start:stop].unsqueeze(1).to(
-                    dtype=messages.dtype
-                )
-                messages = messages * normalization_slice
-                aggregated.index_add_(0, destination[start:stop], messages)
+                source_states = x[source[start:stop]]
+                messages = mx.matmul(source_states, weight)
+                messages = messages * mx.expand_dims(normalization[start:stop], axis=1)
+                aggregated = aggregate_by_destination(aggregated, destination[start:stop], messages)
 
         x = self.output_norm(aggregated + self.self_loop(x) + x)
-        x = F.gelu(x)
+        x = nn.gelu(x)
         x = self.dropout(x)
 
         residual = x
         x = self.ffn_in(self.ffn_norm(x))
-        x = F.gelu(x)
+        x = nn.gelu(x)
         x = self.ffn_out(x)
         x = self.dropout(x)
         return residual + x
 
 
 class RGCNModel(nn.Module):
-    def __init__(self, graph_config: GraphConfig, model_config: ModelConfig) -> None:
+    def __init__(self, graph_config: GraphConfig, model_config: ModelConfig, dtype: Any) -> None:
         super().__init__()
         self.input_projection = nn.Sequential(
-            nn.Linear(graph_config.input_dim, model_config.hidden_dim, bias=False),
-            nn.LayerNorm(model_config.hidden_dim),
+            nn.Linear(
+                input_dims=graph_config.input_dim,
+                output_dims=model_config.hidden_dim,
+                bias=False,
+            ),
+            nn.LayerNorm(dims=model_config.hidden_dim),
             nn.GELU(),
-            nn.Dropout(model_config.dropout),
+            nn.Dropout(p=model_config.dropout),
         )
-        self.layers = nn.ModuleList(
-            [
-                RGCNBlock(
-                    hidden_dim=model_config.hidden_dim,
-                    num_relations=graph_config.num_relations,
-                    dropout=model_config.dropout,
-                    edge_chunk_size=model_config.edge_chunk_size,
-                    ffn_multiplier=model_config.ffn_multiplier,
-                )
-                for _ in range(model_config.num_layers)
-            ]
+        self.layers = [
+            RGCNBlock(
+                hidden_dim=model_config.hidden_dim,
+                num_relations=graph_config.num_relations,
+                dropout=model_config.dropout,
+                edge_chunk_size=model_config.edge_chunk_size,
+                ffn_multiplier=model_config.ffn_multiplier,
+                dtype=dtype,
+            )
+            for _ in range(model_config.num_layers)
+        ]
+        self.classifier_norm = nn.LayerNorm(dims=model_config.hidden_dim)
+        self.classifier = nn.Linear(
+            input_dims=model_config.hidden_dim,
+            output_dims=graph_config.num_classes,
+            bias=True,
         )
-        self.classifier_norm = nn.LayerNorm(model_config.hidden_dim)
-        self.classifier = nn.Linear(model_config.hidden_dim, graph_config.num_classes)
+        self.set_dtype(dtype)
 
-    def forward(self, features: Tensor, relations: list[tuple[Tensor, Tensor, Tensor]]) -> Tensor:
+    def __call__(self, features: Any, relations: list[tuple[Any, Any, Any]]) -> Any:
         x = self.input_projection(features)
         for layer in self.layers:
             x = layer(x, relations)
         return self.classifier(self.classifier_norm(x))
 
 
-def build_optimizer(config: OptimizerConfig, model: nn.Module):
+def build_optimizer(config: OptimizerConfig):
     if config.name == "adamw":
-        return torch.optim.AdamW(
-            model.parameters(),
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-        )
+        return optim.AdamW(learning_rate=config.lr, weight_decay=config.weight_decay)
     if config.name == "sgd":
-        return torch.optim.SGD(
-            model.parameters(),
-            lr=config.lr,
-            weight_decay=config.weight_decay,
+        return optim.SGD(
+            learning_rate=config.lr,
             momentum=0.9,
+            weight_decay=config.weight_decay,
         )
     raise ValueError(f"Unsupported optimizer: {config.name}")
 
@@ -606,18 +559,16 @@ def slugify(value: str) -> str:
     return collapsed.strip("-") or "run"
 
 
-def create_run_dir(config: BenchmarkConfig, device: torch.device) -> Path:
+def create_run_dir(config: BenchmarkConfig, backend: str) -> Path:
     root = Path(config.run.results_dir)
     root.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = root / f"{timestamp}_{slugify(config.name)}_{backend_label(device)}"
+    run_dir = root / f"{timestamp}_{slugify(config.name)}_{backend}"
     run_dir.mkdir(parents=False, exist_ok=False)
     return run_dir
 
 
-def steady_state_records(
-    history: list[dict[str, Any]], warmup_epochs: int
-) -> list[dict[str, Any]]:
+def steady_state_records(history: list[dict[str, Any]], warmup_epochs: int) -> list[dict[str, Any]]:
     steady = [record for record in history if record["epoch"] > warmup_epochs]
     return steady if steady else history
 
@@ -640,16 +591,12 @@ def summarize_history(
         "setup_duration_sec": history[0]["setup_seconds"],
         "steady_state_epoch_sec_median": statistics.median(epoch_seconds),
         "steady_state_epoch_sec_mean": statistics.fmean(epoch_seconds),
-        "steady_state_message_edge_updates_per_sec_median": statistics.median(
-            message_rates
-        ),
-        "steady_state_message_edge_updates_per_sec_mean": statistics.fmean(
-            message_rates
-        ),
+        "steady_state_message_edge_updates_per_sec_median": statistics.median(message_rates),
+        "steady_state_message_edge_updates_per_sec_mean": statistics.fmean(message_rates),
         "steady_state_train_accuracy_mean": statistics.fmean(accuracy_values),
         "final_loss": history[-1]["loss"],
         "peak_memory_gb": max(peak_values) if peak_values else None,
-        "train_nodes": int(graph.train_index.numel()),
+        "train_nodes": int(graph.train_index.shape[0]),
     }
 
 
@@ -684,28 +631,32 @@ def format_epoch_line(record: dict[str, Any]) -> str:
     )
 
 
-def run_benchmark(config: BenchmarkConfig, device: torch.device) -> Path:
+def run_benchmark(config: BenchmarkConfig, device: Any, device_name: str) -> Path:
+    ensure_mlx_available()
     started_at = iso_utc_now()
     setup_start = time.perf_counter()
 
     seed_everything(config.graph.seed)
-    configure_runtime(config, device)
-    graph = build_synthetic_graph(config.graph, device)
-    model = RGCNModel(config.graph, config.model).to(device)
-    optimizer = build_optimizer(config.optimizer, model)
-    scaler = make_grad_scaler(device, config.run.precision)
+    configure_runtime(device)
+    dtype = precision_to_dtype(config.run.precision)
+    graph = build_synthetic_graph(config.graph, dtype)
+    model = RGCNModel(config.graph, config.model, dtype)
+    optimizer = build_optimizer(config.optimizer)
+    loss_and_grad_fn = nn.value_and_grad(model, loss_fn)
 
-    synchronize_device(device)
+    mx.eval(model.parameters())
+    synchronize_device()
     setup_seconds = time.perf_counter() - setup_start
-    run_dir = create_run_dir(config, device)
+    run_dir = create_run_dir(config, f"mlx-{device_name}")
 
-    hardware = collect_hardware_info(device)
+    hardware = collect_hardware_info(device_name)
     command = " ".join(shlex.quote(arg) for arg in sys.argv)
     message_edges_per_epoch = graph.total_edges * config.model.num_layers
 
     print(f"Run directory: {run_dir}", flush=True)
-    print(f"Backend: {backend_label(device)}", flush=True)
-    print(f"Device: {hardware.get('device_name', 'unknown')}", flush=True)
+    print("Framework: mlx", flush=True)
+    print(f"Backend: {device_name}", flush=True)
+    print(f"Device: {hardware['device_name']}", flush=True)
     print(
         "Workload: "
         f"nodes={config.graph.num_nodes:,}, "
@@ -729,39 +680,23 @@ def run_benchmark(config: BenchmarkConfig, device: torch.device) -> Path:
     while True:
         epoch += 1
         model.train()
-        optimizer.zero_grad(set_to_none=True)
-        reset_peak_memory_stats(device)
-        synchronize_device(device)
+        reset_peak_memory_stats()
+        synchronize_device()
         epoch_start = time.perf_counter()
 
-        with autocast_context(device, config.run.precision):
-            logits = model(graph.features, graph.relations)
-            train_logits = logits.index_select(0, graph.train_index)
-            loss = F.cross_entropy(train_logits, graph.train_labels)
+        (loss_value, accuracy_value), grads = loss_and_grad_fn(model, graph)
+        optimizer.update(model, grads)
+        mx.eval(loss_value, accuracy_value, model.parameters(), optimizer.state)
+        synchronize_device()
 
-        detached_logits = train_logits.detach()
-        accuracy = (
-            detached_logits.argmax(dim=1).eq(graph.train_labels).float().mean().item()
-        )
-        loss_value = float(loss.detach().item())
-
-        if scaler is None:
-            loss.backward()
-            optimizer.step()
-        else:
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-
-        synchronize_device(device)
         epoch_seconds = time.perf_counter() - epoch_start
         elapsed_seconds = time.perf_counter() - training_start
-        memory_stats = read_memory_stats(device)
+        memory_stats = read_memory_stats()
 
         record = {
             "epoch": epoch,
-            "loss": loss_value,
-            "train_accuracy": accuracy,
+            "loss": float(loss_value.item()),
+            "train_accuracy": float(accuracy_value.item()),
             "epoch_seconds": epoch_seconds,
             "elapsed_seconds": elapsed_seconds,
             "message_edge_updates_per_sec": message_edges_per_epoch / epoch_seconds,
@@ -786,9 +721,9 @@ def run_benchmark(config: BenchmarkConfig, device: torch.device) -> Path:
         "run": {
             "name": config.name,
             "description": config.description,
-            "framework": "pytorch",
-            "backend": backend_label(device),
-            "device": str(device),
+            "framework": "mlx",
+            "backend": device_name,
+            "device": device_name,
             "precision": config.run.precision,
             "started_at_utc": started_at,
             "finished_at_utc": finished_at,
@@ -819,12 +754,21 @@ def run_benchmark(config: BenchmarkConfig, device: torch.device) -> Path:
     return run_dir
 
 
+def loss_fn(model: Any, graph: SyntheticGraph) -> tuple[Any, Any]:
+    logits = model(graph.features, graph.relations)
+    train_logits = logits[graph.train_index]
+    loss = mx.mean(nn.losses.cross_entropy(train_logits, graph.train_labels))
+    accuracy = mx.mean(mx.argmax(train_logits, axis=1) == graph.train_labels)
+    return loss, accuracy
+
+
 def main() -> int:
+    ensure_mlx_available()
     args = parse_args()
-    device = resolve_device(args.device)
     config = apply_cli_overrides(load_benchmark_config(args.config), args)
-    validate_config(config, device)
-    run_benchmark(config, device)
+    validate_config(config)
+    device, device_name = resolve_device(args.device)
+    run_benchmark(config, device, device_name)
     return 0
 
 

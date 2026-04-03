@@ -5,13 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "pytorch-rgcn-benchmark"
 version = "0.1.0"
-description = "Portable PyTorch RGCN benchmark for CUDA, ROCm, and Apple MPS backends."
+description = "PyTorch RGCN benchmark for CUDA, ROCm, and Apple MPS, plus an MLX-native Apple track."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.26"]
 
+[project.optional-dependencies]
+apple = ["mlx"]
+
 [project.scripts]
 rgcn-benchmark = "rgcn_benchmark.train:main"
+rgcn-benchmark-mlx = "rgcn_benchmark.mlx_train:main"
 rgcn-compare = "rgcn_benchmark.compare:main"
 
 [tool.setuptools]
